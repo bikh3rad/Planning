@@ -10,10 +10,11 @@ When we look at this repo in 12 months, "why did we pick NATS over Kafka?" shoul
 
 | # | Title | Status |
 | --- | --- | --- |
-| [0001](./0001-monorepo-tooling.md) | Monorepo tooling | Accepted |
+| [0001](./0001-monorepo-tooling.md) | Monorepo tooling | Superseded by [0005](./0005-go-workspace-and-build.md) |
 | [0002](./0002-event-sourcing-vs-outbox.md) | Event sourcing vs CRUD-with-outbox | Accepted |
 | [0003](./0003-messaging-nats-vs-kafka.md) | NATS JetStream vs Kafka | Accepted |
 | [0004](./0004-database-immutability-enforcement.md) | Database-level immutability enforcement | Accepted |
+| [0005](./0005-go-workspace-and-build.md) | Go workspace & build tooling | Accepted |
 
 ## When to write a new ADR
 
