@@ -8,20 +8,27 @@ trustC ships as three independently-deployable artifacts: a Go backend (~7 servi
 
 ### Backend
 
+The backend is seeded from [`mequq/go-template`](https://github.com/mequq/go-template) and adopts its service-internal conventions wholesale; we replicate them across services within a single Go module per [ADR 0005](../adr/0005-go-workspace-and-build.md).
+
 | Layer | Choice | Why |
 | --- | --- | --- |
-| Language | Go 1.22+ | Strong static typing, fast builds, simple deployment, mature stdlib |
-| HTTP router | `chi` | Idiomatic, light, composable middleware, sticks to `net/http` |
-| DB driver | `pgx` (v5) | Postgres-native, fastest in benchmarks, exposes Postgres features cleanly |
-| Query layer | `sqlc` | Generates type-safe Go from explicit SQL — no ORM magic |
-| Migrations | `golang-migrate` | Up/down migrations, integrates with Postgres, used by every service |
+| Language | Go 1.22+ | Strong static typing, fast builds, simple deployment, stdlib `ServeMux` pattern routing |
+| HTTP router | stdlib `net/http.ServeMux` | Go 1.22 pattern matching covers our routing needs; no external router dep |
+| DI | **Google Wire** | Compile-time DI; per-service composition root at `cmd/<service>/wire.go` |
+| Config | **koanf** | YAML file (`--config` flag) + `APP_`-prefixed env overlay |
+| DB driver | `pgx` (v5) + `otelsql` | Postgres-native; `otelsql` traces every query without per-call instrumentation |
+| Query layer | `sqlc` | Compile-time-checked SQL types; an additive layer on top of `pgx` |
+| Migrations | `golang-migrate` | Up/down migrations; per-service subdirs under `migrations/<service>/` |
 | Messaging client | `nats.go` (JetStream) | Official Go client, durable consumers, replay |
 | Crypto | `crypto/ed25519`, `crypto/sha256` | stdlib — no third-party deps for security-critical code |
 | Cache / locks | Redis 7 / Valkey | Idempotency cache, rate limiting, short-lived state |
-| Build tooling | Single Go module + Taskfile | See [ADR 0005](../adr/0005-go-workspace-and-build.md) |
-| Logging | `log/slog` (stdlib) | Structured, zero-dep, Go 1.21+ |
-| Observability | OpenTelemetry Go SDK → Grafana / Tempo / Loki / Prometheus | Vendor-neutral |
-| Testing | stdlib `testing` + `testcontainers-go` + `pgregory.net/rapid` | Standard idioms; real Postgres / NATS in integration tests |
+| Lifecycle | `app.Controller` registry | Components self-register `Start` / `Shutdown` / `Healthz`; `biz.healthz` fans out concurrently |
+| Mocks | **mockery** v2 | Generated from `services/<svc>/internal/biz` into `internal/mocks` (config in `.mockery.yaml`) |
+| API docs | **swag** | Annotations on handlers; UI mounted at `/swagger/` |
+| Build tooling | Single Go module + **Taskfile** | See [ADR 0005](../adr/0005-go-workspace-and-build.md) |
+| Logging | `log/slog` (stdlib) bridged to OTel logs | Structured, zero-dep, Go 1.21+ |
+| Observability | OpenTelemetry Go SDK over OTLP gRPC → Grafana / Tempo / Loki / Prometheus | Vendor-neutral |
+| Testing | stdlib `testing` + `testcontainers-go` + `pgregory.net/rapid` + **ramsql** for in-memory tests | Standard idioms; real Postgres / NATS in integration tests; ramsql for fast unit tests |
 | Containerization | Docker (multi-stage, distroless final) | Static Go binaries → tiny images |
 | Orchestration | Kubernetes | PRD §55 |
 | IaC | Terraform | PRD §25 |
@@ -60,11 +67,17 @@ Alternative considered for mobile: **Flutter**. Rejected for the small team beca
 
 Rationale for the deltas from a "default Go startup stack":
 
-- **`chi` over `fiber`/`echo`/`gin`**: chi sticks to `net/http`, has the smallest API surface, and composes middleware cleanly. Fiber uses fasthttp (incompatible with the broader middleware ecosystem). Gin's API encourages monolithic handlers.
-- **`sqlc` over an ORM (`gorm`, `ent`)**: financial code requires explicit, reviewable SQL. ORMs hide query behavior; sqlc generates types from the SQL we write. This matches the "no ORM beyond a query builder" rule carried over from ADR 0001's analysis.
+- **stdlib `net/http.ServeMux` over `chi`/`gin`/`fiber`/`echo`**: Go 1.22's pattern matching covers our needs; `otelhttp` plus a small set of `pkg/middlewares` covers the rest. No router dep to track.
+- **Google Wire over manual constructor injection**: with 7 services and a deep dependency graph per service, Wire's compile-time validation pays for the codegen step. Composition root per service at `cmd/<service>/wire.go`.
+- **koanf over Viper**: simpler API, cleaner env-overlay semantics, no implicit globals. Adopted from the template.
+- **mockery over hand-written mocks or testify mocks**: generated mocks stay in sync with interfaces; CI fails when an interface changes without regenerating.
+- **swag (code-first) over OpenAPI-first**: faster to ship while the team is small. Revisit if non-Go consumers need to author the spec.
+- **`sqlc` over an ORM (`gorm`, `ent`)**: financial code requires explicit, reviewable SQL. ORMs hide query behavior; sqlc generates types from SQL we write. This is a deliberate addition to the template, which uses raw `pgx`.
+- **`otelsql` wrapping `pgx`**: every query gets a span without per-call boilerplate.
 - **PostgreSQL only, no MongoDB / DynamoDB**: financial workloads need ACID, foreign keys, DB-level constraints (notably for [ADR 0004](../adr/0004-database-immutability-enforcement.md)) and Postgres RLS for multi-tenancy.
 - **NATS JetStream over Kafka**: target throughput (1M ledger entries/day ≈ 12/s) is well within NATS, operationally simpler. See [ADR 0003](../adr/0003-messaging-nats-vs-kafka.md).
 - **REST over gRPC for internal calls**: keeps the contract surface uniform with the public API. Revisit if internal call latency becomes a bottleneck.
+- **`Taskfile` over `Make + dagger` (the template's choice)**: cross-platform, declarative, avoids Make's tab/space pitfalls. We may layer dagger pipelines on top later for CI parity, but Taskfile is the primary orchestrator. See [ADR 0005](../adr/0005-go-workspace-and-build.md).
 - **React Native over native iOS + Android**: small team, code reuse with web, sufficient performance for an approval / dashboard app (no graphics-heavy workloads).
 
 ## Three repos, not one
@@ -94,62 +107,75 @@ This avoids the worst pattern (hand-written client types that drift from the ser
 
 ## Backend repository structure (`trustc-platform`)
 
-See [ADR 0005](../adr/0005-go-workspace-and-build.md) for the rationale.
+Seeded from [`mequq/go-template`](https://github.com/mequq/go-template); the template's single-service layout is replicated under `services/<service>/internal/` for each service inside the single Go module. See [ADR 0005](../adr/0005-go-workspace-and-build.md) for the full rationale.
 
 ```
 trustc-platform/
-├── cmd/                          # service entrypoints (one main.go each)
-│   ├── auth/
-│   ├── workflow/
-│   ├── treasury/
-│   ├── ledger/
-│   ├── governance/
-│   ├── audit/
-│   ├── notification/
-│   └── gateway/
-├── services/                     # per-service domain code, mirrors DDD layers
-│   ├── workflow/
-│   │   ├── domain/               # entities, value objects
-│   │   ├── application/          # use cases, commands, queries
-│   │   ├── infrastructure/
-│   │   │   ├── postgres/         # repositories, sqlc-generated code, migrations
-│   │   │   ├── messaging/        # event publishers, consumers, outbox writer
-│   │   │   └── http/             # handlers, DTOs
-│   │   ├── policies/             # service-local invariant guards
-│   │   └── events/               # event payload definitions specific to this service
+├── cmd/                          # service entrypoints — one composition root per service
+│   ├── auth/{main.go, wire.go, wire_gen.go}
+│   ├── workflow/{main.go, wire.go, wire_gen.go}
 │   ├── treasury/...
+│   ├── ledger/...
+│   ├── governance/...
+│   ├── audit/...
+│   ├── notification/...
+│   └── gateway/...
+├── services/                     # per-service code; positional `internal/` enforces isolation
+│   ├── workflow/
+│   │   └── internal/             # only cmd/workflow can import this subtree
+│   │       ├── service/
+│   │       │   ├── server.go     # HTTP wiring, /metrics, /swagger
+│   │       │   ├── handler/      # HTTP handlers (implement service.Handler)
+│   │       │   └── dto/          # request / response shapes
+│   │       ├── biz/              # use cases (Usecase…, Repository… interfaces)
+│   │       ├── repo/             # repository implementations
+│   │       ├── datasource/       # service-specific DB / queue clients
+│   │       ├── entity/           # domain types
+│   │       ├── mocks/            # mockery-generated
+│   │       ├── policies/         # service-local invariant guards
+│   │       └── events/           # service-local event payload definitions
+│   ├── treasury/internal/...
+│   ├── ledger/internal/...
 │   └── ...
-├── internal/                     # shared infrastructure (NOT business logic)
+├── internal/                     # cross-service shared infrastructure (no business logic)
+│   ├── app/                      # Application, HTTPServer, Controller, KConfig, AppLogger, OTLP
 │   ├── event/                    # envelope schema, canonical-JSON, signing, validation
-│   ├── contracts/                # protobuf-generated Go types
+│   ├── contracts/                # protobuf-generated Go types (output of `buf generate`)
 │   ├── crypto/                   # ed25519, sha256 helpers
-│   ├── pgx/                      # connection helpers, RLS context setter, migration runner
+│   ├── pgx/                      # pool helpers, RLS context setter, otelsql wiring, migration runner
 │   ├── nats/                     # JetStream client, outbox relay
 │   ├── otel/                     # tracer / meter / logger setup
 │   ├── httpx/                    # required-headers middleware, response envelope, error mapping
-│   └── testing/                  # invariant test runners, fixtures, builders
-├── contracts/                    # .proto files (source of truth)
+│   └── testing/                  # invariant test runners, fixtures, builders, ramsql helpers
+├── pkg/middlewares/              # external-importable per-route HTTP middlewares
+├── contracts/                    # .proto source of truth
 │   ├── events/
 │   └── api/
+├── migrations/                   # per-service: migrations/<service>/000001_*.{up,down}.sql
 ├── infrastructure/
-│   ├── terraform/                # cloud infra
-│   ├── kubernetes/               # service manifests, helm charts
-│   └── docker/                   # local dev compose
+│   ├── terraform/
+│   ├── kubernetes/
+│   └── compose/                  # docker-compose includes (monitoring, postgres, redis)
 ├── tools/
-│   ├── codegen/                  # buf + sqlc invocation wrappers
+│   ├── codegen/                  # buf + sqlc + wire + mockery + swag wrappers
 │   ├── policy-cli/               # author + validate governance policies
 │   └── replay/                   # event replay for testing
 ├── docs/                         # implementation-level docs (operational, runbooks)
+├── docker-compose.yml            # aggregates infrastructure/compose/* includes
+├── Taskfile.yml
+├── .mockery.yaml
+├── .golangci.yaml
 ├── go.mod
-├── go.sum
-└── Taskfile.yml
+└── go.sum
 ```
 
 Rules:
 
-- **No business logic in `internal/`.** Only protocol-level utilities (event contracts, crypto, transport, observability). Cross-domain types are forbidden — that would re-introduce the "shared god service" anti-pattern (PRD §64).
-- **Each service owns its DB schema and migrations.** Migrations live in `services/<service>/infrastructure/postgres/migrations/`. No cross-schema reads at the application layer.
-- **`internal/` is the language-level boundary.** Go enforces that nothing outside the module can import these packages — the boundary that the TS stack used Turborepo + pnpm strict mode to approximate.
+- **No business logic in repo-level `internal/`.** Only protocol-level utilities (event contracts, app lifecycle, crypto, transport, observability). Cross-domain types are forbidden — that would re-introduce the "shared god service" anti-pattern (PRD §64).
+- **Each service's `services/<svc>/internal/` is unimportable from any other service** — Go's positional `internal/` rule enforces this at the language level.
+- **Each service owns its DB schema and migrations.** Migrations live under `migrations/<service>/`. No cross-schema reads at the application layer.
+- **`wire_gen.go` is generated**, never hand-edited. Modify the relevant `wire.go` provider set and run `task generate`.
+- **Every datasource, handler, and use case registers its own healthz hook** on the shared `app.Controller` — no central healthz orchestration.
 
 ## Web repository structure (`trustc-web`)
 
@@ -191,27 +217,53 @@ trustc-mobile/
 └── package.json
 ```
 
-## Per-backend-service folder structure (DDD)
+## Per-backend-service layout (clean architecture, from the template)
 
-Each backend service follows the same internal layout, mirroring PRD §26:
+Each backend service follows the template's clean-architecture structure, mirroring PRD §26:
 
 ```
-services/<service>/
-├── domain/                       # entities, value objects, domain services
-├── application/                  # use cases, commands, queries
-├── infrastructure/
-│   ├── postgres/                 # repositories, migrations, sqlc queries
-│   ├── messaging/                # event publishers, consumers, outbox writer
-│   └── http/                     # handlers, DTOs, validators
+services/<service>/internal/
+├── service/
+│   ├── server.go                 # HTTP wiring + /metrics + /swagger
+│   ├── handler/                  # HTTP handlers — implement service.Handler
+│   └── dto/                      # request / response shapes
+├── biz/                          # use cases: Usecase… interfaces (consumed by handlers)
+│                                 #            Repository… interfaces (implemented by repo)
+├── repo/                         # repository implementations bound via wire.Bind
+├── datasource/                   # service-specific DB / queue clients (most live in repo-level internal/)
+├── entity/                       # domain types
+├── mocks/                        # mockery-generated mocks for biz interfaces
 ├── policies/                     # service-local invariant guards
 └── events/                       # event payload definitions specific to this service
 ```
+
+Per-service composition root (`cmd/<service>/wire.go`):
+
+```go
+//go:build wireinject
+// +build wireinject
+
+package main
+
+func newApp(...) (*app.Application, func(), error) {
+    panic(wire.Build(
+        app.ProviderSet,                                    // Application, HTTPServer, Controller, KConfig, Logger, OTLP
+        internalpgx.ProviderSet, internalnats.ProviderSet,  // shared datasource clients
+        workflowdatasource.ProviderSet,                     // service-specific clients (if any)
+        workflowrepo.ProviderSet,                           // repo.Bind to biz.Repository… interfaces
+        workflowbiz.ProviderSet,                            // use cases
+        workflowservice.ProviderSet,                        // HTTP wiring + handlers
+    ))
+}
+```
+
+Adding a handler: implement `service.Handler` (`RegisterHandler(ctx) error` registers routes on the injected `*http.ServeMux`), expose a `New…` provider, append it to the service's `NewServiceList` in `services/<svc>/internal/service/handler/wire.go`, then run `task generate`.
 
 ## Build & deploy
 
 | Repo | Pipeline (per PR) | Pipeline (per merge to main) |
 | --- | --- | --- |
-| Backend | `golangci-lint` → `go vet` → `go test` → `govulncheck` → `buf lint` | + build per-service images, push to registry, deploy to dev |
+| Backend | `task generate` (must produce no diff) → `golangci-lint` → `go vet` → `go test` → `govulncheck` → `buf lint` | + build per-service images, push to registry, deploy to dev |
 | Web | `eslint` → `tsc --noEmit` → `vitest` | + build standalone Next.js image, push, deploy to dev |
 | Mobile | `eslint` → `tsc --noEmit` → `vitest` → Maestro smoke tests | + EAS build (preview channel) |
 
@@ -220,11 +272,28 @@ services/<service>/
 - Web uses blue/green via Kubernetes deployment swap
 - Mobile: EAS Update for JS-only changes; full app-store submission for native changes
 
+## Common backend tasks
+
+Adapted from the template's Make targets to Taskfile, parameterised by service:
+
+| Task | What it does |
+| --- | --- |
+| `task generate` | Regenerate Wire DI graphs (every `cmd/<service>`), mockery mocks, swag docs, sqlc queries; `go mod tidy` |
+| `task devtools` | One-time: install `golangci-lint`, `gofumpt`, `wire`, `mockery`, `swag`, `gci`, `sqlc` |
+| `task lint` | `golangci-lint run` against the whole tree |
+| `task test` | `go test ./...` |
+| `task test:integration` | Integration suite using `testcontainers-go` |
+| `task test:invariants` | Cross-cutting invariant suite (the `tests/invariants/` package) |
+| `task swagger:<service>` | Regenerate `services/<svc>/docs/` from swag annotations |
+| `task run:<service>` | Run a single service locally with hot reload (`air`) |
+| `task build:<service>` | Build the per-service Docker image |
+| `task migrate:<service>` | Apply / rollback golang-migrate against the local DB |
+
 ## Local dev
 
-- `task up` (in `trustc-platform`) brings up Postgres, Redis, NATS via `docker compose`
-- `task run/<service>` runs a single service with hot reload (`air`)
-- `task test/integration` runs the full integration suite using `testcontainers-go`
+- `task up` brings up Postgres, Redis, NATS, and the monitoring stack (Tempo, Loki, Prometheus, Grafana, OTel collector) via `docker compose`
+- `task run:<service>` runs a single service against the local stack
+- Each service reads `config.yaml` (copied from `config.example.yaml`) overlaid with `APP_`-prefixed env vars
 - `task seed` populates a fixture organization with sample data
 - Web: `pnpm dev` against the local backend
 - Mobile: `npx expo start` with the iOS simulator or Android emulator pointed at the local gateway
@@ -260,9 +329,27 @@ Coverage gates: 80% line; 100% on the policy aggregator and ledger validator.
 - **Native iOS + Android instead of RN.** Considered; rejected for team size — see the mobile section above.
 - **gRPC for service-to-service.** Considered; we chose REST + the event bus to keep the contract surface uniform with the public API. Revisit if internal call latency becomes a bottleneck.
 - **A meta-framework for mobile (e.g. Tamagui's full stack)**. Expo + React Native is enough; an extra abstraction layer is not free.
+- **Manual mock writing.** Mockery is non-negotiable for the `biz.Repository…` interfaces; hand-written mocks drift.
+- **Hand-edited `wire_gen.go`.** Always regenerate via `task generate`; CI fails if the regenerated file differs from committed.
+
+## Deltas from `mequq/go-template`
+
+We adopt the template's choices wholesale except for these deliberate deltas:
+
+| Concern | Template | trustC | Why |
+| --- | --- | --- | --- |
+| Module structure | Single service per repo | Multi-service in one Go module | 7 services share enough infrastructure that a single module is operationally simpler. See [ADR 0005](../adr/0005-go-workspace-and-build.md). |
+| Build orchestration | Make + dagger | Taskfile | Cross-platform, declarative, no Docker-in-Docker for casual local builds |
+| Query layer | raw `pgx` | `pgx` + `sqlc` | Compile-time type safety on financial SQL; sqlc is additive |
+| Migrations location | `migrations/` (single dir) | `migrations/<service>/` | Per-service ownership of schema |
+| Healthz endpoint paths | `/healthz/...` | Same — kept |
+| API doc UI | `/swagger/` | Same — kept |
+| Config bootstrap | `config.yaml` + `APP_` env | Same — kept |
+| Lifecycle pattern | `app.Controller` self-registration | Same — kept (in repo-level `internal/app`) |
 
 ## See also
 
 - [02-domains.md](./02-domains.md) — boundaries the repo structure enforces
 - [15-roadmap.md](./15-roadmap.md) — what gets built first; web and mobile are parallel workstreams that begin once Phase 3 (Workflow Engine) exposes a stable API
 - [ADR 0002](../adr/0002-event-sourcing-vs-outbox.md), [ADR 0003](../adr/0003-messaging-nats-vs-kafka.md), [ADR 0005](../adr/0005-go-workspace-and-build.md)
+- Template: [`mequq/go-template`](https://github.com/mequq/go-template) — the seed scaffold
