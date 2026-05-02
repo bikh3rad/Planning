@@ -1,8 +1,10 @@
 # ADR 0001 — Monorepo tooling
 
-**Status:** Accepted
+**Status:** Superseded by [ADR 0005](./0005-go-workspace-and-build.md)
 **Date:** 2026-05-02
 **Deciders:** Solution architecture
+
+> This ADR chose pnpm + Turborepo for a TypeScript / NestJS monorepo. The implementation language has since been changed to Go; ADR 0005 records the replacement decision. The alternatives analysis below is preserved for historical context — the rejection of Bazel (operational weight) and the rejection of "single big package" (couples deploys) carry over to the Go stack and are referenced from ADR 0005.
 
 ## Context
 

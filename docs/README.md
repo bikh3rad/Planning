@@ -39,10 +39,11 @@ If you're about to design or implement a subsystem, read its dedicated deep-dive
 Decisions that close off other reasonable options live as ADRs:
 
 - [ADR index & template](./adr/README.md)
-- [0001 — Monorepo tooling](./adr/0001-monorepo-tooling.md)
+- [0001 — Monorepo tooling](./adr/0001-monorepo-tooling.md) — superseded by 0005
 - [0002 — Event sourcing vs outbox pattern](./adr/0002-event-sourcing-vs-outbox.md)
 - [0003 — NATS JetStream vs Kafka](./adr/0003-messaging-nats-vs-kafka.md)
 - [0004 — Database-level immutability enforcement](./adr/0004-database-immutability-enforcement.md)
+- [0005 — Go workspace & build tooling](./adr/0005-go-workspace-and-build.md)
 
 ## Conventions
 
