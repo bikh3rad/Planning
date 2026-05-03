@@ -24,7 +24,7 @@ The backend is seeded from [`mequq/go-template`](https://github.com/mequq/go-tem
 | Cache / locks | Redis 7 / Valkey | Idempotency cache, rate limiting, short-lived state |
 | Lifecycle | `app.Controller` registry | Components self-register `Start` / `Shutdown` / `Healthz`; `biz.healthz` fans out concurrently |
 | Mocks | **mockery** v2 | Generated from `services/<svc>/internal/biz` into `internal/mocks` (config in `.mockery.yaml`) |
-| API docs | **swag** | Annotations on handlers; UI mounted at `/swagger/` |
+| API contracts | **OpenAPI 3.1** (code-first via **swag**) | Annotations on handlers; spec published to `contracts/openapi/`; UI at `/swagger/` |
 | Build tooling | Single Go module + **Taskfile** | See [ADR 0005](../adr/0005-go-workspace-and-build.md) |
 | Logging | `log/slog` (stdlib) bridged to OTel logs | Structured, zero-dep, Go 1.21+ |
 | Observability | OpenTelemetry Go SDK over OTLP gRPC → Grafana / Tempo / Loki / Prometheus | Vendor-neutral |
@@ -33,6 +33,7 @@ The backend is seeded from [`mequq/go-template`](https://github.com/mequq/go-tem
 | Orchestration | Kubernetes | PRD §55 |
 | IaC | Terraform | PRD §25 |
 | CI | GitHub Actions | Matches the repo host |
+| CD | **ArgoCD** | GitOps — syncs cluster to manifests in `infrastructure/kubernetes/` |
 | Secrets | Cloud-native (AWS Secrets Manager / Vault) | Off-disk |
 
 ### Web application
@@ -97,13 +98,13 @@ Rationale for the deltas from a "default Go startup stack":
 
 ### Cross-repo contracts
 
-Cross-cutting types (event envelopes, API DTOs) are defined as **protobuf** in `trustc-platform/contracts/`. Generation:
+Cross-cutting API shapes are defined as **OpenAPI 3.1 specs** in `trustc-platform/contracts/openapi/`. Generation:
 
-- `buf generate` produces Go code (committed in `trustc-platform/internal/contracts/`)
-- A published npm package `@trustc/contracts` (built from the same `.proto` files in CI) gives the web and mobile repos identical types
-- `buf breaking` runs in CI on the contracts directory
+- `oapi-codegen` produces Go server stubs and request/response types (committed in `trustc-platform/internal/contracts/`)
+- `openapi-typescript` produces a published npm package `@trustc/contracts` consumed by web and mobile
+- `spectral lint` + `oasdiff breaking` run in CI to catch spec violations and breaking changes
 
-This avoids the worst pattern (hand-written client types that drift from the server) while keeping each repo independently buildable.
+This avoids hand-written client types that drift from the server while keeping each repo independently buildable.
 
 ## Backend repository structure (`trustc-platform`)
 
@@ -140,7 +141,7 @@ trustc-platform/
 ├── internal/                     # cross-service shared infrastructure (no business logic)
 │   ├── app/                      # Application, HTTPServer, Controller, KConfig, AppLogger, OTLP
 │   ├── event/                    # envelope schema, canonical-JSON, signing, validation
-│   ├── contracts/                # protobuf-generated Go types (output of `buf generate`)
+│   ├── contracts/                # oapi-codegen-generated Go types (output of `task generate`)
 │   ├── crypto/                   # ed25519, sha256 helpers
 │   ├── pgx/                      # pool helpers, RLS context setter, otelsql wiring, migration runner
 │   ├── nats/                     # JetStream client, outbox relay
@@ -148,16 +149,15 @@ trustc-platform/
 │   ├── httpx/                    # required-headers middleware, response envelope, error mapping
 │   └── testing/                  # invariant test runners, fixtures, builders, ramsql helpers
 ├── pkg/middlewares/              # external-importable per-route HTTP middlewares
-├── contracts/                    # .proto source of truth
-│   ├── events/
-│   └── api/
+├── contracts/
+│   └── openapi/                  # OpenAPI 3.1 specs — source of truth for all API shapes
 ├── migrations/                   # per-service: migrations/<service>/000001_*.{up,down}.sql
 ├── infrastructure/
 │   ├── terraform/
 │   ├── kubernetes/
 │   └── compose/                  # docker-compose includes (monitoring, postgres, redis)
 ├── tools/
-│   ├── codegen/                  # buf + sqlc + wire + mockery + swag wrappers
+│   ├── codegen/                  # oapi-codegen + sqlc + wire + mockery + swag wrappers
 │   ├── policy-cli/               # author + validate governance policies
 │   └── replay/                   # event replay for testing
 ├── docs/                         # implementation-level docs (operational, runbooks)
@@ -263,13 +263,17 @@ Adding a handler: implement `service.Handler` (`RegisterHandler(ctx) error` regi
 
 | Repo | Pipeline (per PR) | Pipeline (per merge to main) |
 | --- | --- | --- |
-| Backend | `task generate` (must produce no diff) → `golangci-lint` → `go vet` → `go test` → `govulncheck` → `buf lint` | + build per-service images, push to registry, deploy to dev |
-| Web | `eslint` → `tsc --noEmit` → `vitest` | + build standalone Next.js image, push, deploy to dev |
+| Backend | `task generate` (must produce no diff) → `golangci-lint` → `go vet` → `go test` → `govulncheck` → `spectral lint` → `oasdiff breaking` | + build per-service images, push to registry, update image tag in `infrastructure/kubernetes/` |
+| Web | `eslint` → `tsc --noEmit` → `vitest` | + build standalone Next.js image, push, update image tag |
 | Mobile | `eslint` → `tsc --noEmit` → `vitest` → Maestro smoke tests | + EAS build (preview channel) |
 
-- Per-tag (`vN.N.N`): backend & web deploy to staging → manual gate → production. Mobile submits to TestFlight / Play internal testing.
-- Backend uses rolling deploys; Postgres requires careful migration sequencing
-- Web uses blue/green via Kubernetes deployment swap
+**CD is handled by ArgoCD (GitOps):**
+
+- CI writes the new image tag into `infrastructure/kubernetes/<env>/` and commits; ArgoCD detects the diff and syncs the cluster
+- Environments: `dev` (auto-sync on every merge), `staging` and `production` (manual sync gate in ArgoCD)
+- Per-tag (`vN.N.N`): CI promotes the tag to staging manifests → ArgoCD syncs staging → manual ArgoCD sync to production. Mobile submits to TestFlight / Play internal testing.
+- Backend uses rolling deploys (ArgoCD `RollingUpdate`); Postgres migrations run as an init container / pre-sync hook before pods are replaced
+- Web uses blue/green via ArgoCD `Rollout` (Argo Rollouts)
 - Mobile: EAS Update for JS-only changes; full app-store submission for native changes
 
 ## Common backend tasks
@@ -278,8 +282,8 @@ Adapted from the template's Make targets to Taskfile, parameterised by service:
 
 | Task | What it does |
 | --- | --- |
-| `task generate` | Regenerate Wire DI graphs (every `cmd/<service>`), mockery mocks, swag docs, sqlc queries; `go mod tidy` |
-| `task devtools` | One-time: install `golangci-lint`, `gofumpt`, `wire`, `mockery`, `swag`, `gci`, `sqlc` |
+| `task generate` | Regenerate Wire DI graphs (every `cmd/<service>`), mockery mocks, OpenAPI specs (swag), oapi-codegen stubs, sqlc queries; `go mod tidy` |
+| `task devtools` | One-time: install `golangci-lint`, `gofumpt`, `wire`, `mockery`, `swag`, `oapi-codegen`, `spectral`, `gci`, `sqlc` |
 | `task lint` | `golangci-lint run` against the whole tree |
 | `task test` | `go test ./...` |
 | `task test:integration` | Integration suite using `testcontainers-go` |
@@ -327,7 +331,7 @@ Coverage gates: 80% line; 100% on the policy aggregator and ledger validator.
 - **Event sourcing framework.** Outbox-on-Postgres is simpler; see [ADR 0002](../adr/0002-event-sourcing-vs-outbox.md).
 - **A centralized "shared services" library.** Forbidden by the domain isolation rules in [02-domains.md](./02-domains.md).
 - **Native iOS + Android instead of RN.** Considered; rejected for team size — see the mobile section above.
-- **gRPC for service-to-service.** Considered; we chose REST + the event bus to keep the contract surface uniform with the public API. Revisit if internal call latency becomes a bottleneck.
+- **gRPC / protobuf.** All APIs (internal and external) use REST + OpenAPI 3.1. This keeps the contract surface uniform, eliminates a separate IDL toolchain, and means a single spec drives both server stubs (`oapi-codegen`) and client types (`openapi-typescript`).
 - **A meta-framework for mobile (e.g. Tamagui's full stack)**. Expo + React Native is enough; an extra abstraction layer is not free.
 - **Manual mock writing.** Mockery is non-negotiable for the `biz.Repository…` interfaces; hand-written mocks drift.
 - **Hand-edited `wire_gen.go`.** Always regenerate via `task generate`; CI fails if the regenerated file differs from committed.
@@ -342,6 +346,8 @@ We adopt the template's choices wholesale except for these deliberate deltas:
 | Build orchestration | Make + dagger | Taskfile | Cross-platform, declarative, no Docker-in-Docker for casual local builds |
 | Query layer | raw `pgx` | `pgx` + `sqlc` | Compile-time type safety on financial SQL; sqlc is additive |
 | Migrations location | `migrations/` (single dir) | `migrations/<service>/` | Per-service ownership of schema |
+| API contracts | None (template is single-service) | OpenAPI 3.1 specs in `contracts/openapi/`; `oapi-codegen` → Go; `openapi-typescript` → npm | Single source of truth for all API shapes; no protobuf/gRPC toolchain |
+| CD | None defined in template | ArgoCD (GitOps) | Declarative sync from `infrastructure/kubernetes/`; env promotion via manifest branches/dirs |
 | Healthz endpoint paths | `/healthz/...` | Same — kept |
 | API doc UI | `/swagger/` | Same — kept |
 | Config bootstrap | `config.yaml` + `APP_` env | Same — kept |
