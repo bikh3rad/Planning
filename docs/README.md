@@ -33,8 +33,9 @@ If you're about to design or implement a subsystem, read its dedicated deep-dive
 | 14 | [Tech stack & repo structure](./architecture/14-tech-stack.md) | Setup, tooling, deployment |
 | 15 | [Delivery roadmap](./architecture/15-roadmap.md) | Sequencing, milestones |
 | 16 | [Non-functional requirements](./architecture/16-non-functional.md) | Performance, scale, DR, retention |
-| 17 | [UI structure](./architecture/17-ui-structure.md) | Client surfaces, IA per persona, design language |
-| 18 | [CI/CD pipelines](./architecture/17-cicd.md) | Implementing, debugging, or changing any pipeline |
+| 17 | [CI/CD pipelines](./architecture/17-cicd.md) | Implementing, debugging, or changing any pipeline |
+| 18 | [UI structure](./architecture/18-ui-structure.md) | Client surfaces, IA per persona, design language |
+
 
 ## Architecture Decision Records
 
