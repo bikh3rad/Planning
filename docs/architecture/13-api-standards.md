@@ -104,11 +104,12 @@ Error codes are stable, documented, and machine-checkable. Client behavior keys 
 
 ## URL conventions
 
-- Resource-oriented: `/expenses`, `/wallets/{id}`, `/escrow/{id}/release`
+- Resource-oriented: `/apis/<service_name>/v1alpha1/expenses`, `/apis/<service_name>/v1alpha1/wallets/{id}`, `/apis/<service_name>/v1alpha1/escrow/{id}/release`
 - kebab-case in paths
 - `snake_case` in JSON keys
 - Plural nouns for collections, singular for actions on instances
-- Versioning: `/v1/...` prefix; new versions are introduced when a breaking change is needed, supported in parallel for at least 90 days
+- Versioning: `/apis/<service_name>/<version>/...` prefix; new versions are introduced when a breaking change is needed, supported in parallel for at least 90 days
+- Version format: `v1alpha1`, `v1beta1`, `v1` (stability progression); breaking changes bump the version segment
 
 ## Pagination
 
@@ -153,8 +154,8 @@ Per [12-security.md](./12-security.md#idempotency):
 
 ## Versioning & compatibility
 
-- `/v1/...` is the public version surface
-- Internal service-to-service APIs use `/internal/v1/...` and have stricter compatibility rules (must support the previous version for the duration of a rolling deploy)
+- `/apis/<service_name>/v1alpha1/...` is the public version surface
+- Internal service-to-service APIs use `/apis/<service_name>/internal/v1alpha1/...` and have stricter compatibility rules (must support the previous version for the duration of a rolling deploy)
 - Event schemas are versioned independently (see [05-events.md](./05-events.md#schema-versioning-rules))
 
 ## Documentation
