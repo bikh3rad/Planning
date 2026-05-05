@@ -1,4 +1,4 @@
-# 17 — UI Structure
+# 18 — UI Structure
 
 > The shape of the client surfaces — who they're for, how they're organised, and the design language they share. This is a planning doc; no code lives in this repo. Sources: PRD §6, §9, §17, §32, §66, §155, §214; architecture docs [03](./03-services.md), [07](./07-treasury.md), [08](./08-workflow.md), [09](./09-governance.md), [11](./11-audit-observability.md), [12](./12-security.md), [14](./14-tech-stack.md).
 
