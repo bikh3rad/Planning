@@ -34,6 +34,7 @@ If you're about to design or implement a subsystem, read its dedicated deep-dive
 | 15 | [Delivery roadmap](./architecture/15-roadmap.md) | Sequencing, milestones |
 | 16 | [Non-functional requirements](./architecture/16-non-functional.md) | Performance, scale, DR, retention |
 | 17 | [UI structure](./architecture/17-ui-structure.md) | Client surfaces, IA per persona, design language |
+| 18 | [CI/CD pipelines](./architecture/17-cicd.md) | Implementing, debugging, or changing any pipeline |
 
 ## Architecture Decision Records
 

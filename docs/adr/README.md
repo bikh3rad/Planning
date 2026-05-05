@@ -15,6 +15,7 @@ When we look at this repo in 12 months, "why did we pick NATS over Kafka?" shoul
 | [0003](./0003-messaging-nats-vs-kafka.md) | NATS JetStream vs Kafka | Accepted |
 | [0004](./0004-database-immutability-enforcement.md) | Database-level immutability enforcement | Accepted |
 | [0005](./0005-go-workspace-and-build.md) | Go workspace & build tooling | Accepted |
+| [0006](./0006-monorepo-and-nx-build.md) | Monorepo consolidation and Nx build orchestration | Accepted |
 
 ## When to write a new ADR
 

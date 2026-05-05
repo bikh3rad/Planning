@@ -24,7 +24,7 @@ The backend is seeded from [`mequq/go-template`](https://github.com/mequq/go-tem
 | Cache / locks | Redis 7 / Valkey | Idempotency cache, rate limiting, short-lived state |
 | Lifecycle | `app.Controller` registry | Components self-register `Start` / `Shutdown` / `Healthz`; `biz.healthz` fans out concurrently |
 | Mocks | **mockery** v2 | Generated from `services/<svc>/internal/biz` into `internal/mocks` (config in `.mockery.yaml`) |
-| API docs | **swag** | Annotations on handlers; UI mounted at `/swagger/` |
+| API contracts | **OpenAPI 3.1** (code-first via **swag**) | Annotations on handlers; spec published to `contracts/openapi/`; UI at `/swagger/` |
 | Build tooling | Single Go module + **Taskfile** | See [ADR 0005](../adr/0005-go-workspace-and-build.md) |
 | Logging | `log/slog` (stdlib) bridged to OTel logs | Structured, zero-dep, Go 1.21+ |
 | Observability | OpenTelemetry Go SDK over OTLP gRPC → Grafana / Tempo / Loki / Prometheus | Vendor-neutral |
@@ -33,6 +33,7 @@ The backend is seeded from [`mequq/go-template`](https://github.com/mequq/go-tem
 | Orchestration | Kubernetes | PRD §55 |
 | IaC | Terraform | PRD §25 |
 | CI | GitHub Actions | Matches the repo host |
+| CD | **ArgoCD** | GitOps — syncs cluster to manifests in `infrastructure/kubernetes/` |
 | Secrets | Cloud-native (AWS Secrets Manager / Vault) | Off-disk |
 
 ### Web application
@@ -80,107 +81,126 @@ Rationale for the deltas from a "default Go startup stack":
 - **`Taskfile` over `Make + dagger` (the template's choice)**: cross-platform, declarative, avoids Make's tab/space pitfalls. We may layer dagger pipelines on top later for CI parity, but Taskfile is the primary orchestrator. See [ADR 0005](../adr/0005-go-workspace-and-build.md).
 - **React Native over native iOS + Android**: small team, code reuse with web, sufficient performance for an approval / dashboard app (no graphics-heavy workloads).
 
-## Three repos, not one
+## One monorepo
 
-| Repo | Contents | Deployed as |
+All three workloads live in a single `trustc` repository. See [ADR 0006](../adr/0006-monorepo-and-nx-build.md) for the rationale and the full alternative analysis.
+
+| App / lib | Contents | Deployed as |
 | --- | --- | --- |
-| `trustc-platform` | All Go services, infra, contracts source-of-truth | 8 service images (gateway + 7 services) |
-| `trustc-web` | Next.js web app | One web image |
-| `trustc-mobile` | Expo / React Native app | iOS + Android builds via EAS |
+| `apps/platform` | All Go services, infra, contracts source-of-truth | 8 service images (gateway + 7 services) |
+| `apps/web` | Next.js web app | One web image |
+| `apps/mobile` | Expo / React Native app | iOS + Android builds via EAS |
+| `libs/contracts` | OpenAPI 3.1 specs + generated Go types + `@trustc/contracts` npm package | Build-time artifact |
 
-### Why three repos, not one
+**Build orchestration:** [Nx](https://nx.dev) is the top-level task runner (affected detection, remote caching, task graph). Taskfile remains the Go-specific executor inside `apps/platform`; Nx calls `task <target>` via `project.json` targets. pnpm workspaces manage the Node.js packages.
 
-- Different toolchains (Go vs npm vs Expo / native build pipelines)
-- Different release cadences — services deploy continuously; mobile ships through app stores on a slower clock
-- Different reviewer pools
-- A mixed-language monorepo's CI complexity outweighs the convenience of "one clone"
+### Contract generation
 
-### Cross-repo contracts
+OpenAPI 3.1 specs live in `libs/contracts/openapi/` as the single source of truth. The `contracts:generate` Nx target runs:
 
-Cross-cutting types (event envelopes, API DTOs) are defined as **protobuf** in `trustc-platform/contracts/`. Generation:
+- `oapi-codegen` → Go server stubs and request/response types into `apps/platform/internal/contracts/`
+- `openapi-typescript` → TypeScript types published as `@trustc/contracts`, consumed by web and mobile
+- `spectral lint` + `oasdiff breaking` to catch spec violations and breaking changes
 
-- `buf generate` produces Go code (committed in `trustc-platform/internal/contracts/`)
-- A published npm package `@trustc/contracts` (built from the same `.proto` files in CI) gives the web and mobile repos identical types
-- `buf breaking` runs in CI on the contracts directory
+Both `apps/platform` and `apps/web` / `apps/mobile` declare `contracts` as an Nx dependency, so a spec change automatically marks all three as affected in CI.
 
-This avoids the worst pattern (hand-written client types that drift from the server) while keeping each repo independently buildable.
+## Repository structure (`trustc` monorepo)
 
-## Backend repository structure (`trustc-platform`)
+### Backend (`apps/platform`)
 
 Seeded from [`mequq/go-template`](https://github.com/mequq/go-template); the template's single-service layout is replicated under `services/<service>/internal/` for each service inside the single Go module. See [ADR 0005](../adr/0005-go-workspace-and-build.md) for the full rationale.
 
 ```
-trustc-platform/
-├── cmd/                          # service entrypoints — one composition root per service
-│   ├── auth/{main.go, wire.go, wire_gen.go}
-│   ├── workflow/{main.go, wire.go, wire_gen.go}
-│   ├── treasury/...
-│   ├── ledger/...
-│   ├── governance/...
-│   ├── audit/...
-│   ├── notification/...
-│   └── gateway/...
-├── services/                     # per-service code; positional `internal/` enforces isolation
-│   ├── workflow/
-│   │   └── internal/             # only cmd/workflow can import this subtree
-│   │       ├── service/
-│   │       │   ├── server.go     # HTTP wiring, /metrics, /swagger
-│   │       │   ├── handler/      # HTTP handlers (implement service.Handler)
-│   │       │   └── dto/          # request / response shapes
-│   │       ├── biz/              # use cases (Usecase…, Repository… interfaces)
-│   │       ├── repo/             # repository implementations
-│   │       ├── datasource/       # service-specific DB / queue clients
-│   │       ├── entity/           # domain types
-│   │       ├── mocks/            # mockery-generated
-│   │       ├── policies/         # service-local invariant guards
-│   │       └── events/           # service-local event payload definitions
-│   ├── treasury/internal/...
-│   ├── ledger/internal/...
-│   └── ...
-├── internal/                     # cross-service shared infrastructure (no business logic)
-│   ├── app/                      # Application, HTTPServer, Controller, KConfig, AppLogger, OTLP
-│   ├── event/                    # envelope schema, canonical-JSON, signing, validation
-│   ├── contracts/                # protobuf-generated Go types (output of `buf generate`)
-│   ├── crypto/                   # ed25519, sha256 helpers
-│   ├── pgx/                      # pool helpers, RLS context setter, otelsql wiring, migration runner
-│   ├── nats/                     # JetStream client, outbox relay
-│   ├── otel/                     # tracer / meter / logger setup
-│   ├── httpx/                    # required-headers middleware, response envelope, error mapping
-│   └── testing/                  # invariant test runners, fixtures, builders, ramsql helpers
-├── pkg/middlewares/              # external-importable per-route HTTP middlewares
-├── contracts/                    # .proto source of truth
-│   ├── events/
-│   └── api/
-├── migrations/                   # per-service: migrations/<service>/000001_*.{up,down}.sql
+trustc/
+├── apps/
+│   ├── platform/                     # Go backend
+│   │   ├── project.json              # Nx project descriptor (wraps Taskfile targets)
+│   │   ├── go.mod
+│   │   ├── go.sum
+│   │   ├── Taskfile.yml
+│   │   ├── .mockery.yaml
+│   │   ├── .golangci.yaml
+│   │   ├── cmd/                      # service entrypoints — one composition root per service
+│   │   │   ├── auth/{main.go, wire.go, wire_gen.go}
+│   │   │   ├── workflow/{main.go, wire.go, wire_gen.go}
+│   │   │   ├── treasury/...
+│   │   │   ├── ledger/...
+│   │   │   ├── governance/...
+│   │   │   ├── audit/...
+│   │   │   ├── notification/...
+│   │   │   └── gateway/...
+│   │   ├── services/                 # per-service code; positional `internal/` enforces isolation
+│   │   │   ├── workflow/internal/
+│   │   │   │   ├── service/
+│   │   │   │   │   ├── server.go     # HTTP wiring, /metrics, /swagger
+│   │   │   │   │   ├── handler/      # HTTP handlers (implement service.Handler)
+│   │   │   │   │   └── dto/          # request / response shapes
+│   │   │   │   ├── biz/              # use cases (Usecase…, Repository… interfaces)
+│   │   │   │   ├── repo/             # repository implementations
+│   │   │   │   ├── datasource/       # service-specific DB / queue clients
+│   │   │   │   ├── entity/           # domain types
+│   │   │   │   ├── mocks/            # mockery-generated
+│   │   │   │   ├── policies/         # service-local invariant guards
+│   │   │   │   └── events/           # service-local event payload definitions
+│   │   │   ├── treasury/internal/...
+│   │   │   ├── ledger/internal/...
+│   │   │   └── ...
+│   │   ├── internal/                 # cross-service shared infrastructure (no business logic)
+│   │   │   ├── app/                  # Application, HTTPServer, Controller, KConfig, AppLogger, OTLP
+│   │   │   ├── event/                # envelope schema, canonical-JSON, signing, validation
+│   │   │   ├── contracts/            # oapi-codegen-generated Go types (output of `task generate`)
+│   │   │   ├── crypto/               # ed25519, sha256 helpers
+│   │   │   ├── pgx/                  # pool helpers, RLS context setter, otelsql wiring, migration runner
+│   │   │   ├── nats/                 # JetStream client, outbox relay
+│   │   │   ├── otel/                 # tracer / meter / logger setup
+│   │   │   ├── httpx/                # required-headers middleware, response envelope, error mapping
+│   │   │   └── testing/              # invariant test runners, fixtures, builders, ramsql helpers
+│   │   ├── pkg/middlewares/          # external-importable per-route HTTP middlewares
+│   │   ├── migrations/               # per-service: migrations/<service>/000001_*.{up,down}.sql
+│   │   ├── tools/
+│   │   │   ├── codegen/              # oapi-codegen + sqlc + wire + mockery + swag wrappers
+│   │   │   ├── policy-cli/           # author + validate governance policies
+│   │   │   └── replay/               # event replay for testing
+│   │   └── docker-compose.yml        # local dev stack (Postgres, Redis, NATS, monitoring)
+│   ├── web/                          # Next.js (App Router)
+│   │   ├── project.json
+│   │   ├── package.json
+│   │   └── ...
+│   └── mobile/                       # Expo / React Native
+│       ├── project.json
+│       ├── package.json
+│       └── ...
+├── libs/
+│   └── contracts/                    # OpenAPI 3.1 specs — source of truth for all API shapes
+│       ├── project.json
+│       ├── openapi/                  # spec files
+│       └── generated/
+│           ├── go/                   # oapi-codegen output (symlinked into apps/platform/internal/contracts/)
+│           └── ts/                   # openapi-typescript output (@trustc/contracts)
 ├── infrastructure/
 │   ├── terraform/
 │   ├── kubernetes/
-│   └── compose/                  # docker-compose includes (monitoring, postgres, redis)
-├── tools/
-│   ├── codegen/                  # buf + sqlc + wire + mockery + swag wrappers
-│   ├── policy-cli/               # author + validate governance policies
-│   └── replay/                   # event replay for testing
-├── docs/                         # implementation-level docs (operational, runbooks)
-├── docker-compose.yml            # aggregates infrastructure/compose/* includes
-├── Taskfile.yml
-├── .mockery.yaml
-├── .golangci.yaml
-├── go.mod
-└── go.sum
+│   └── compose/
+├── .github/
+│   └── workflows/
+├── nx.json                           # Nx workspace config, target defaults, cache inputs
+├── package.json                      # pnpm workspace root
+└── pnpm-workspace.yaml
 ```
 
 Rules:
 
-- **No business logic in repo-level `internal/`.** Only protocol-level utilities (event contracts, app lifecycle, crypto, transport, observability). Cross-domain types are forbidden — that would re-introduce the "shared god service" anti-pattern (PRD §64).
+- **No business logic in `apps/platform/internal/`.** Only protocol-level utilities. Cross-domain types are forbidden (PRD §64).
 - **Each service's `services/<svc>/internal/` is unimportable from any other service** — Go's positional `internal/` rule enforces this at the language level.
-- **Each service owns its DB schema and migrations.** Migrations live under `migrations/<service>/`. No cross-schema reads at the application layer.
-- **`wire_gen.go` is generated**, never hand-edited. Modify the relevant `wire.go` provider set and run `task generate`.
-- **Every datasource, handler, and use case registers its own healthz hook** on the shared `app.Controller` — no central healthz orchestration.
+- **Each service owns its DB schema and migrations.** Migrations live under `apps/platform/migrations/<service>/`.
+- **`wire_gen.go` is generated**, never hand-edited. Run `task generate` (or `nx run platform:generate`).
+- **Every datasource, handler, and use case registers its own healthz hook** on the shared `app.Controller`.
 
-## Web repository structure (`trustc-web`)
+### Web (`apps/web`)
 
 ```
-trustc-web/
+apps/web/
+├── project.json
 ├── app/                          # Next.js App Router
 │   ├── (auth)/
 │   ├── (operator)/expenses/
@@ -197,10 +217,11 @@ trustc-web/
 └── next.config.mjs
 ```
 
-## Mobile repository structure (`trustc-mobile`)
+### Mobile (`apps/mobile`)
 
 ```
-trustc-mobile/
+apps/mobile/
+├── project.json
 ├── app/                          # Expo Router file-based routes
 │   ├── (auth)/
 │   ├── (tabs)/
@@ -261,15 +282,22 @@ Adding a handler: implement `service.Handler` (`RegisterHandler(ctx) error` regi
 
 ## Build & deploy
 
-| Repo | Pipeline (per PR) | Pipeline (per merge to main) |
-| --- | --- | --- |
-| Backend | `task generate` (must produce no diff) → `golangci-lint` → `go vet` → `go test` → `govulncheck` → `buf lint` | + build per-service images, push to registry, deploy to dev |
-| Web | `eslint` → `tsc --noEmit` → `vitest` | + build standalone Next.js image, push, deploy to dev |
-| Mobile | `eslint` → `tsc --noEmit` → `vitest` → Maestro smoke tests | + EAS build (preview channel) |
+CI is orchestrated by **Nx** (`nx affected`) so only projects touched by a PR are tested. See [17-cicd.md](./17-cicd.md) for the full pipeline design.
 
-- Per-tag (`vN.N.N`): backend & web deploy to staging → manual gate → production. Mobile submits to TestFlight / Play internal testing.
-- Backend uses rolling deploys; Postgres requires careful migration sequencing
-- Web uses blue/green via Kubernetes deployment swap
+| Project | Per-PR targets (via `nx affected`) | On merge to `main` |
+| --- | --- | --- |
+| `platform` | `generate` (diff check) → `lint` → `test` → `test:integration` → `govulncheck` | + build per-service images, push to registry, update image tag in `infrastructure/kubernetes/` |
+| `contracts` | `generate` (diff check) → `spectral lint` → `oasdiff breaking` | + publish `@trustc/contracts` npm package |
+| `web` | `lint` → `tsc` → `test` | + build standalone Next.js image, push, update image tag |
+| `mobile` | `lint` → `tsc` → `test` → Maestro smoke tests | + EAS build (preview channel) |
+
+**CD is handled by ArgoCD (GitOps):**
+
+- CI writes the new image tag into `infrastructure/kubernetes/<env>/` and commits; ArgoCD detects the diff and syncs the cluster
+- Environments: `dev` (auto-sync on every merge), `staging` and `production` (manual sync gate in ArgoCD)
+- Per-tag (`vN.N.N`): CI promotes the tag to staging manifests → ArgoCD syncs staging → manual ArgoCD sync to production. Mobile submits to TestFlight / Play internal testing.
+- Backend uses rolling deploys (ArgoCD `RollingUpdate`); Postgres migrations run as an init container / pre-sync hook before pods are replaced
+- Web uses blue/green via ArgoCD `Rollout` (Argo Rollouts)
 - Mobile: EAS Update for JS-only changes; full app-store submission for native changes
 
 ## Common backend tasks
@@ -278,8 +306,8 @@ Adapted from the template's Make targets to Taskfile, parameterised by service:
 
 | Task | What it does |
 | --- | --- |
-| `task generate` | Regenerate Wire DI graphs (every `cmd/<service>`), mockery mocks, swag docs, sqlc queries; `go mod tidy` |
-| `task devtools` | One-time: install `golangci-lint`, `gofumpt`, `wire`, `mockery`, `swag`, `gci`, `sqlc` |
+| `task generate` | Regenerate Wire DI graphs (every `cmd/<service>`), mockery mocks, OpenAPI specs (swag), oapi-codegen stubs, sqlc queries; `go mod tidy` |
+| `task devtools` | One-time: install `golangci-lint`, `gofumpt`, `wire`, `mockery`, `swag`, `oapi-codegen`, `spectral`, `gci`, `sqlc` |
 | `task lint` | `golangci-lint run` against the whole tree |
 | `task test` | `go test ./...` |
 | `task test:integration` | Integration suite using `testcontainers-go` |
@@ -327,7 +355,7 @@ Coverage gates: 80% line; 100% on the policy aggregator and ledger validator.
 - **Event sourcing framework.** Outbox-on-Postgres is simpler; see [ADR 0002](../adr/0002-event-sourcing-vs-outbox.md).
 - **A centralized "shared services" library.** Forbidden by the domain isolation rules in [02-domains.md](./02-domains.md).
 - **Native iOS + Android instead of RN.** Considered; rejected for team size — see the mobile section above.
-- **gRPC for service-to-service.** Considered; we chose REST + the event bus to keep the contract surface uniform with the public API. Revisit if internal call latency becomes a bottleneck.
+- **gRPC / protobuf.** All APIs (internal and external) use REST + OpenAPI 3.1. This keeps the contract surface uniform, eliminates a separate IDL toolchain, and means a single spec drives both server stubs (`oapi-codegen`) and client types (`openapi-typescript`).
 - **A meta-framework for mobile (e.g. Tamagui's full stack)**. Expo + React Native is enough; an extra abstraction layer is not free.
 - **Manual mock writing.** Mockery is non-negotiable for the `biz.Repository…` interfaces; hand-written mocks drift.
 - **Hand-edited `wire_gen.go`.** Always regenerate via `task generate`; CI fails if the regenerated file differs from committed.
@@ -342,6 +370,8 @@ We adopt the template's choices wholesale except for these deliberate deltas:
 | Build orchestration | Make + dagger | Taskfile | Cross-platform, declarative, no Docker-in-Docker for casual local builds |
 | Query layer | raw `pgx` | `pgx` + `sqlc` | Compile-time type safety on financial SQL; sqlc is additive |
 | Migrations location | `migrations/` (single dir) | `migrations/<service>/` | Per-service ownership of schema |
+| API contracts | None (template is single-service) | OpenAPI 3.1 specs in `contracts/openapi/`; `oapi-codegen` → Go; `openapi-typescript` → npm | Single source of truth for all API shapes; no protobuf/gRPC toolchain |
+| CD | None defined in template | ArgoCD (GitOps) | Declarative sync from `infrastructure/kubernetes/`; env promotion via manifest branches/dirs |
 | Healthz endpoint paths | `/healthz/...` | Same — kept |
 | API doc UI | `/swagger/` | Same — kept |
 | Config bootstrap | `config.yaml` + `APP_` env | Same — kept |
@@ -351,5 +381,5 @@ We adopt the template's choices wholesale except for these deliberate deltas:
 
 - [02-domains.md](./02-domains.md) — boundaries the repo structure enforces
 - [15-roadmap.md](./15-roadmap.md) — what gets built first; web and mobile are parallel workstreams that begin once Phase 3 (Workflow Engine) exposes a stable API
-- [ADR 0002](../adr/0002-event-sourcing-vs-outbox.md), [ADR 0003](../adr/0003-messaging-nats-vs-kafka.md), [ADR 0005](../adr/0005-go-workspace-and-build.md)
+- [ADR 0002](../adr/0002-event-sourcing-vs-outbox.md), [ADR 0003](../adr/0003-messaging-nats-vs-kafka.md), [ADR 0005](../adr/0005-go-workspace-and-build.md), [ADR 0006](../adr/0006-monorepo-and-nx-build.md)
 - Template: [`mequq/go-template`](https://github.com/mequq/go-template) — the seed scaffold
