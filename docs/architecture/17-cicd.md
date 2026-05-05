@@ -6,16 +6,18 @@
 
 ## System overview
 
-trustC separates **CI** (GitHub Actions — build, verify, publish artifacts) from **CD** (ArgoCD — declarative GitOps sync to Kubernetes). The two systems handshake via a manifest update commit: CI pushes a new image tag into `infrastructure/kubernetes/`; ArgoCD detects the diff and reconciles the cluster.
+trustC separates **CI** (GitHub Actions + Nx — build, verify, publish artifacts) from **CD** (ArgoCD — declarative GitOps sync to Kubernetes). The two systems handshake via a manifest update commit: CI pushes a new image tag into `infrastructure/kubernetes/`; ArgoCD detects the diff and reconciles the cluster.
+
+All three workloads (`apps/platform`, `apps/web`, `apps/mobile`) live in the `trustc` monorepo. **Nx** drives affected-task detection — only the projects touched by a PR are built and tested. See [ADR 0006](../adr/0006-monorepo-and-nx-build.md) for the monorepo rationale.
 
 ```mermaid
 flowchart LR
-    subgraph CI ["GitHub Actions (CI)"]
-        A[PR opened] --> B[Quality gates]
+    subgraph CI ["GitHub Actions + Nx (CI)"]
+        A[PR opened] --> B[nx affected:\nquality gates]
         B --> C[Merge to main]
-        C --> D[Build image]
+        C --> D[nx affected:\nbuild images]
         D --> E[Push to registry]
-        E --> F[Update image tag\nin k8s manifests]
+        E --> F[Update image tags\nin k8s manifests]
     end
     subgraph CD ["ArgoCD (CD)"]
         F --> G[Detect manifest diff]
@@ -25,13 +27,31 @@ flowchart LR
     end
 ```
 
-**Three repos, one CD system:**
+**One monorepo, one CD system:**
 
-| Repo | CI runner | CD target |
+| Nx project | CI runner | CD target |
 | --- | --- | --- |
-| `trustc-platform` | GitHub Actions | ArgoCD → K8s (8 service images) |
-| `trustc-web` | GitHub Actions | ArgoCD → K8s (1 web image) |
-| `trustc-mobile` | GitHub Actions | EAS (iOS + Android) — ArgoCD not used for mobile |
+| `apps/platform` | GitHub Actions + Nx | ArgoCD → K8s (8 service images) |
+| `apps/web` | GitHub Actions + Nx | ArgoCD → K8s (1 web image) |
+| `apps/mobile` | GitHub Actions + Nx | EAS (iOS + Android) — ArgoCD not used for mobile |
+| `libs/contracts` | GitHub Actions + Nx | npm publish (`@trustc/contracts`) |
+
+## Nx affected detection
+
+`nx affected` computes the project graph from `nx.json` and `project.json` files, then determines which projects are downstream of the changed files.
+
+```mermaid
+graph LR
+    contracts["libs/contracts"] --> platform["apps/platform"]
+    contracts --> web["apps/web"]
+    contracts --> mobile["apps/mobile"]
+```
+
+- A change to `apps/platform/services/ledger/` only affects `platform` — web and mobile CI is skipped.
+- A change to `libs/contracts/openapi/` marks all four projects as affected — all run in parallel.
+- CI command: `nx affected --target=lint,test,build --base=origin/main`
+
+Remote cache (Nx Cloud or self-hosted) means a target whose inputs haven't changed since the last run is restored from cache rather than re-executed — critical for the Go integration test suite.
 
 ---
 
@@ -62,7 +82,7 @@ ArgoCD has one Application per `(repo, env)` pair, pointing at the corresponding
 
 ---
 
-## CI — Backend (`trustc-platform`)
+## CI — Backend (`apps/platform`)
 
 ### Per-PR pipeline
 
@@ -149,7 +169,7 @@ Rules:
 
 ---
 
-## CI — Web (`trustc-web`)
+## CI — Web (`apps/web`)
 
 ### Per-PR pipeline
 
@@ -181,7 +201,7 @@ flowchart TD
 
 ---
 
-## CI — Mobile (`trustc-mobile`)
+## CI — Mobile (`apps/mobile`)
 
 ### Per-PR pipeline
 
@@ -346,4 +366,5 @@ This verifies that the audit log remains a viable recovery mechanism after any c
 - [14-tech-stack.md](./14-tech-stack.md) — tooling choices and repo structure
 - [16-non-functional.md](./16-non-functional.md) — SLOs, load targets, DR
 - [06-ledger.md](./06-ledger.md#migration-safety) — ledger migration constraints
-- [ADR 0005](../adr/0005-go-workspace-and-build.md) — build tooling rationale
+- [ADR 0005](../adr/0005-go-workspace-and-build.md) — Go module and Taskfile rationale
+- [ADR 0006](../adr/0006-monorepo-and-nx-build.md) — monorepo consolidation and Nx rationale
